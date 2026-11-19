@@ -2810,12 +2810,17 @@ class TestCallerBlockCutoff:
                     if caller:
                         assert caller["tool_id"] in kept_ids
 
-    def test_cutoff_without_caller_references_is_unchanged(self) -> None:
+    def test_cutoff_without_server_tool_references_is_unchanged(self) -> None:
         messages = self._messages()
-        # Index 3's blocks carry callers, but the source lives at index 1...
-        # Remove the callers: cutoff stays where the ToolMessage check puts it.
+        # Strip every reference shape: callers and the *_tool_result
+        # `tool_use_id` (both point at index 1's server_tool_use). With nothing
+        # referenced, the cutoff stays where it is.
         for m in messages:
             if isinstance(m.content, list):
+                m.content = [
+                    b for b in m.content
+                    if not (isinstance(b, dict) and str(b.get("type", "")).endswith("_tool_result"))
+                ]
                 for b in m.content:
                     if isinstance(b, dict):
                         b.pop("caller", None)
@@ -2862,3 +2867,50 @@ class TestCallerBlockCutoff:
             ]),
         ]
         assert SummarizationMiddleware._find_safe_cutoff_point(messages, 3) == 1
+
+    def test_tool_pair_rule_cannot_orphan_a_caller_it_pulls_back_in(self) -> None:
+        """The tool-pair rule must not orphan a caller it pulls back in.
+
+        Programmatic tool calling: the client ``tool_use`` carries its own
+        ``caller``. With the cutoff on the client ``ToolMessage`` the caller
+        rule alone sees nothing, but the tool-pair rule moves the cutoff onto
+        the message holding that ``caller`` — the two rules have to loop.
+        """
+        caller = {"type": "code_execution_20260120", "tool_id": "srvtoolu_code"}
+        messages = [
+            HumanMessage("q"),
+            AIMessage(content=[{"type": "server_tool_use", "id": "srvtoolu_code",
+                                "name": "code_execution", "input": {}}]),
+            AIMessage(
+                content=[{"type": "tool_use", "id": "toolu_a", "name": "lookup",
+                          "input": {}, "caller": caller}],
+                tool_calls=[{"id": "toolu_a", "name": "lookup", "args": {}}],
+            ),
+            ToolMessage("r", tool_call_id="toolu_a"),
+            AIMessage(content=[{"type": "code_execution_tool_result",
+                                "tool_use_id": "srvtoolu_code", "content": {}}]),
+        ]
+
+        assert SummarizationMiddleware._find_safe_cutoff_point(messages, 3) == 1
+
+    def test_result_block_tool_use_id_references_its_server_tool(self) -> None:
+        """A ``*_tool_result`` block references its source through ``tool_use_id``.
+
+        That holds even when no ``caller`` is present — the plain programmatic
+        tool-calling flow. The reference must keep the source message too.
+        """
+        messages = [
+            HumanMessage("q"),
+            AIMessage(content=[{"type": "server_tool_use", "id": "srvtoolu_code",
+                                "name": "code_execution", "input": {}}]),
+            AIMessage(
+                content=[{"type": "tool_use", "id": "toolu_a", "name": "lookup",
+                          "input": {}}],
+                tool_calls=[{"id": "toolu_a", "name": "lookup", "args": {}}],
+            ),
+            ToolMessage("r", tool_call_id="toolu_a"),
+            AIMessage(content=[{"type": "code_execution_tool_result",
+                                "tool_use_id": "srvtoolu_code", "content": {}}]),
+        ]
+
+        assert SummarizationMiddleware._find_safe_cutoff_point(messages, 4) == 1

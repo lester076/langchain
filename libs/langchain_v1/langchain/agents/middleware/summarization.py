@@ -876,30 +876,49 @@ class SummarizationMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, R
 
     @staticmethod
     def _find_safe_cutoff_point(messages: list[AnyMessage], cutoff_index: int) -> int:
-        """Find a safe cutoff point that doesn't split AI/Tool message pairs.
+        """Find a safe cutoff point that doesn't split AI/Tool pairs or server-tool blocks.
 
-        If the message at `cutoff_index` is a `ToolMessage`, search backward for the
-        `AIMessage` containing the corresponding `tool_calls` and adjust the cutoff to
-        include it. This ensures tool call requests and responses stay together.
+        The cutoff must not split AI/Tool message pairs, and must not separate
+        Anthropic server-tool blocks from their source.
 
-        Anthropic server-tool blocks carried across assistant messages are kept
-        together as well: nested blocks (e.g. a `web_search` run inside
-        `code_execution`) reference their source through a `caller.tool_id` that
-        names a `server_tool_use` block in an *earlier* message. A cutoff that
-        separates them makes the next request fail with
-        `invalid_request_error: source tool ... not found`, and since the
-        summarization event only commits after a successful call, the thread
-        then recomputes the same cutoff every turn and stays stuck (#41898).
-        The cutoff moves back to the earliest message holding such a referenced
-        `server_tool_use`, repeating until it stops moving.
+        Two rules, applied together until the cutoff stops moving:
 
-        Falls back to advancing forward past `ToolMessage` objects only if no matching
-        `AIMessage` is found (edge case).
+        - If the message at the cutoff is a `ToolMessage`, the cutoff moves back to the
+          `AIMessage` carrying its `tool_calls`, so a tool call and its result stay
+          together. Falls back to advancing past `ToolMessage` objects only when no
+          matching `AIMessage` is found (edge case).
+        - Preserved blocks that reference a `server_tool_use` (`caller.tool_id`, or the
+          `tool_use_id` of a `*_tool_result` block) pull the cutoff back to the message
+          holding that source. Programmatic tool calling nests these across messages
+          — `code_execution` starts in one `AIMessage`, a client `tool_use` carrying its
+          `caller` and the client `ToolMessage` follow, and the
+          `code_execution_tool_result` closes later — so a single ordered pass is not
+          enough: the tool-pair rule can move the cutoff onto a message whose own
+          `caller` is now orphaned, and a result block's `tool_use_id` is a reference
+          even when no `caller` is present (#41898).
+
+        A cutoff that separates such a reference makes the next request fail with
+        `invalid_request_error: source tool ... not found`. `before_model` commits the
+        new history (`RemoveMessage(id=REMOVE_ALL_MESSAGES)` plus the preserved
+        messages) before the model call runs, so the source message is gone for good
+        and every later turn fails on the broken history.
         """
-        cutoff_index = SummarizationMiddleware._avoid_orphaned_caller_blocks(
-            messages, cutoff_index
-        )
+        seen: set[int] = set()
+        while True:
+            seen.add(cutoff_index)
+            moved = SummarizationMiddleware._avoid_orphaned_caller_blocks(messages, cutoff_index)
+            moved = SummarizationMiddleware._avoid_split_tool_pairs(messages, moved)
+            if moved == cutoff_index:
+                return moved
+            if moved in seen:
+                # The two rules point at each other (pathological history): keep the
+                # earliest cutoff seen, which preserves strictly more messages.
+                return min(seen)
+            cutoff_index = moved
 
+    @staticmethod
+    def _avoid_split_tool_pairs(messages: list[AnyMessage], cutoff_index: int) -> int:
+        """Move the cutoff onto the `AIMessage` that owns a cutoff-leading `ToolMessage`."""
         if cutoff_index >= len(messages) or not isinstance(messages[cutoff_index], ToolMessage):
             return cutoff_index
 
@@ -929,12 +948,14 @@ class SummarizationMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, R
     def _avoid_orphaned_caller_blocks(messages: list[AnyMessage], cutoff_index: int) -> int:
         """Move the cutoff back until no preserved block references a missing source.
 
-        A preserved (at/after the cutoff) content block whose `caller.tool_id`
-        names a `server_tool_use` block living before the cutoff would be sent
-        to Anthropic without its source. Repeatedly move the cutoff to the
-        earliest such source message until no orphaned references remain — the
-        newly included messages can themselves carry callers, so a single pass
-        is not enough.
+        A preserved (at/after the cutoff) content block referencing a
+        `server_tool_use` living before the cutoff would be sent to Anthropic
+        without its source. Two shapes count as a reference: `caller.tool_id`
+        (nested server tools such as a `web_search` inside `code_execution`) and
+        the `tool_use_id` of a `*_tool_result` block (the plain programmatic
+        tool-calling flow). Repeatedly move the cutoff to the earliest such
+        source message until no orphaned references remain — the newly included
+        messages can themselves carry references, so a single pass is not enough.
         """
         while True:
             preserved_ids: set[str] = set()
@@ -949,9 +970,14 @@ class SummarizationMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, R
                     block_id = block.get("id")
                     if isinstance(block_id, str) and block_id:
                         preserved_ids.add(block_id)
+                    references: list[object] = []
                     caller = block.get("caller")
                     if isinstance(caller, dict):
-                        source_id = caller.get("tool_id")
+                        references.append(caller.get("tool_id"))
+                    block_type = block.get("type")
+                    if isinstance(block_type, str) and block_type.endswith("_tool_result"):
+                        references.append(block.get("tool_use_id"))
+                    for source_id in references:
                         if isinstance(source_id, str) and source_id:
                             orphan_sources[source_id] = i
             referenced = orphan_sources.keys() - preserved_ids
